@@ -14,6 +14,9 @@ jobs:
   handle-assignment:
     if: github.event_name == 'issue_comment' && github.event.issue.pull_request == null
     runs-on: ubuntu-latest
+    concurrency:
+      group: issue-assignment-${{ github.event.issue.number }}
+      cancel-in-progress: false
     permissions:
       issues: write
       contents: read
