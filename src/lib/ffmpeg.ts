@@ -104,9 +104,7 @@ export function buildVideoFilter(recipe: EditRecipe, targetW: number, targetH: n
   if (recipe.trimStart > 0 || recipe.trimEnd !== null) {
     const end = recipe.trimEnd !== null ? recipe.trimEnd : 999999;
     filters.push(`trim=start=${recipe.trimStart}:end=${end}`);
-    filters.push("setpts=PTS-STARTPTS");
   }
-
 
   if (recipe.stabilization) {
     filters.push("deshake");
@@ -130,6 +128,12 @@ export function buildVideoFilter(recipe: EditRecipe, targetW: number, targetH: n
       `scale=${targetW}:${targetH}:force_original_aspect_ratio=increase`,
       `crop=${targetW}:${targetH}`
     );
+  }
+
+  // Normalize timestamps only when needed — trim or speed change both
+  // require a clean 0-based timeline to produce correct output duration.
+  if (recipe.trimStart > 0 || recipe.trimEnd !== null || recipe.speed !== 1) {
+    filters.push("setpts=PTS-STARTPTS");
   }
 
   if (recipe.speed !== 1) {
@@ -204,7 +208,8 @@ function buildArguments(
   hasOverlay: boolean,
   overlayInputName: string,
   overlayOptions: ImageOverlayOptions | undefined,
-  hasOriginalAudio: boolean
+  hasOriginalAudio: boolean,
+  videoDuration: number
 ): string[] {
   const vf = buildVideoFilter(recipe, targetW, targetH);
   const audioTrim = hasOriginalAudio ? buildAudioTrimFilter(recipe) : "";
@@ -313,6 +318,14 @@ function buildArguments(
     if (shouldKeepAudio) args.push("-c:a", "aac", "-b:a", "128k");
   }
 
+  // Add explicit output duration when speed != 1 to prevent slight duration
+  // overshoot caused by encoder/filter pipeline frame flush at stream end.
+  if (recipe.speed !== 1) {
+    const sourceDuration = (recipe.trimEnd ?? videoDuration) - recipe.trimStart;
+    const outputDuration = sourceDuration / recipe.speed;
+    args.push("-t", outputDuration.toFixed(6));
+  }
+
   args.push(outputName);
   return args;
 }
@@ -365,6 +378,23 @@ export async function exportVideo(
     onProgress(Math.min(99, Math.round(progress * 100)));
   };
 
+  // Read actual video duration via HTMLVideoElement so we can correctly
+  // compute output duration when trimEnd is null (no trim set by user).
+  // Falls back to trimEnd if metadata loading fails.
+  const videoDuration = await new Promise<number>((resolve) => {
+    const video = document.createElement("video");
+    video.preload = "metadata";
+    video.onloadedmetadata = () => {
+      URL.revokeObjectURL(video.src);
+      resolve(video.duration);
+    };
+    video.onerror = () => {
+      // Safe fallback: use trimEnd if available, otherwise 0 which
+      // will produce no -t argument and leave duration uncapped.
+      resolve(recipe.trimEnd ?? 0);
+    };
+    video.src = URL.createObjectURL(file);
+  });
 
   try {
     await ffmpeg.writeFile(inputName, await fetchFile(file), { signal });
@@ -376,7 +406,7 @@ export async function exportVideo(
       cleanupFiles.add(musicInputName);
     }
 
-    const hasOverlay = !!(overlayOptions?.file);
+    const hasOverlay = !!overlayOptions?.file;
     const overlayExt = overlayOptions?.file?.name.split(".").pop() ?? "png";
     const overlayInputName = `overlay_${sessionId}.${overlayExt}`;
     if (hasOverlay) {
@@ -394,9 +424,22 @@ export async function exportVideo(
         ? `[0:v]${vf}[x];[x][1:v]paletteuse`
         : "[0:v][1:v]paletteuse";
 
+      // Add explicit output duration when speed != 1 to prevent slight duration
+      // overshoot caused by encoder/filter pipeline frame flush at stream end.
+      // Applied to both passes so palette and render are bounded identically.
+      const gifDurationArgs: string[] =
+        recipe.speed !== 1
+          ? (() => {
+              const sourceDuration =
+                (recipe.trimEnd ?? videoDuration) - recipe.trimStart;
+              const outputDuration = sourceDuration / recipe.speed;
+              return ["-t", outputDuration.toFixed(6)];
+            })()
+          : [];
+
       // Pass 1: generate colour palette
       const pass1Code = await ffmpeg.exec(
-        ["-i", inputName, "-vf", vfWithPalette, "-y", paletteName],
+        ["-i", inputName, "-vf", vfWithPalette, ...gifDurationArgs, "-y", paletteName],
         undefined,
         { signal }
       );
@@ -404,7 +447,7 @@ export async function exportVideo(
 
       // Pass 2: render GIF using the palette
       const pass2Code = await ffmpeg.exec(
-        ["-i", inputName, "-i", paletteName, "-lavfi", vfWithPaletteUse, "-y", outputName],
+        ["-i", inputName, "-i", paletteName, "-lavfi", vfWithPaletteUse, ...gifDurationArgs, "-y", outputName],
         undefined,
         { signal }
       );
@@ -443,7 +486,7 @@ export async function exportVideo(
     let args = buildArguments(
       recipe, recipe.format, outputName, inputName, targetW, targetH,
       hasMusicTrack, musicInputName, musicOptions,
-      hasOverlay, overlayInputName, overlayOptions, true
+      hasOverlay, overlayInputName, overlayOptions, true, videoDuration
     );
 
     let exitCode = await ffmpeg.exec(args, undefined, { signal });
@@ -454,7 +497,7 @@ export async function exportVideo(
       args = buildArguments(
         recipe, recipe.format, outputName, inputName, targetW, targetH,
         hasMusicTrack, musicInputName, musicOptions,
-        hasOverlay, overlayInputName, overlayOptions, false
+        hasOverlay, overlayInputName, overlayOptions, false, videoDuration
       );
       exitCode = await ffmpeg.exec(args, undefined, { signal });
     }
@@ -464,7 +507,7 @@ export async function exportVideo(
       args = buildArguments(
         recipe, "webm", fallbackOutputName, inputName, targetW, targetH,
         hasMusicTrack, musicInputName, musicOptions,
-        hasOverlay, overlayInputName, overlayOptions, !missingAudioDetected
+        hasOverlay, overlayInputName, overlayOptions, !missingAudioDetected, videoDuration
       );
 
       const fallbackCode = await ffmpeg.exec(args, undefined, { signal });
